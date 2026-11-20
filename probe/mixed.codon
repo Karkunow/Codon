@@ -1,0 +1,29 @@
+# Mixing route: Python QuantumCircuit (embedded CPython) -> QkCircuit* via the wheel's _accelerate.
+import time
+from python import qiskit
+
+ACC = "/Users/slava.karkunov/Projects/Codon/.venv/lib/python3.12/site-packages/qiskit/_accelerate.abi3.so"
+from C import ACC.qk_circuit_borrow_from_python(cobj) -> cobj
+from C import ACC.qk_circuit_num_qubits(cobj) -> u32
+from C import ACC.qk_circuit_num_instructions(cobj) -> int
+from C import ACC.qk_circuit_copy(cobj) -> cobj
+from C import ACC.qk_circuit_gate(cobj, u8, Ptr[u32], Ptr[float]) -> u32
+from C import ACC.qk_circuit_to_python(cobj) -> cobj
+from C import ACC.qk_circuit_free(cobj) -> None
+
+qc = qiskit.QuantumCircuit(5)
+qc.h(0)
+for q in range(1, 5):
+    qc.cx(q - 1, q)
+
+t0 = time.time()
+raw = qk_circuit_borrow_from_python(qc._data.p)  # QuantumCircuit._data is the CircuitData
+print("borrowed null?", raw == cobj(), "num_qubits", int(qk_circuit_num_qubits(raw)), "num_instr", qk_circuit_num_instructions(raw))
+cp = qk_circuit_copy(raw)                   # owned copy: safe to mutate natively
+qubit = Ptr[u32](1)
+qubit[0] = u32(2)
+qk_circuit_gate(cp, u8(3), qubit, Ptr[float]())  # X on qubit 2
+print("copy num_instr", qk_circuit_num_instructions(cp))
+back = pyobj(qk_circuit_to_python(cp))      # ownership moves to Python
+print("back to python:", str(back.count_ops()))
+print("mixed ms", (time.time() - t0) * 1000)

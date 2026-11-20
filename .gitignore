@@ -1,0 +1,17 @@
+# Build inputs and outputs (build.sh recreates them)
+qiskit/
+*.dylib
+*.so
+.venv/
+__pycache__/
+dl/
+
+# Compiled probes and their outputs
+probe/bench
+probe/bench_rfm
+probe/main
+probe/rfm
+*.out
+
+# Mutation-test scratch
+tests/mutants/

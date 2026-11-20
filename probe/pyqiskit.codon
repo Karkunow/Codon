@@ -1,0 +1,20 @@
+import time
+from python import qiskit
+from python import numpy as pnp
+
+def build(n: int):
+    qc = qiskit.QuantumCircuit(n)
+    qc.h(0)
+    for q in range(1, n):
+        qc.cx(q - 1, q)
+    qc.measure_all()
+    return qc
+
+t0 = time.time()
+qc = build(5)
+bare = qc.remove_final_measurements(inplace=False)
+copy = bare.copy()
+copy.x(2)
+copy.measure_all()
+print(str(qc.num_qubits), str(copy.count_ops()))
+print("python-route ms", (time.time() - t0) * 1000)
