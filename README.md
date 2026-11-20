@@ -2,6 +2,26 @@
 
 Measurement twirling з Python + Qiskit, перекомпільований у нативний машинний код через [Codon](https://github.com/exaloop/codon) і Qiskit C API.
 
+## Збірка і запуск
+
+```bash
+./build.sh                                   # libqiskit + libtwirl.dylib (Codon у ~/.codon)
+python3 -m venv .venv && .venv/bin/pip install qiskit numpy
+.venv/bin/python -I tests/gen_cases.py      # еталон з original.py
+python3 -I tests/check_codon.py             # порівняння з libtwirl.dylib
+```
+
+## Перевірка і швидкість
+
+Час (медіана 50 запусків, 10 задач × 4 копії × 20 кубітів, M1 Pro під навантаженням; `probe/bench_rfm.c`, `probe/bench_rfm.py`):
+
+| | Codon | Python |
+|---|---|---|
+| `preprocess` | 0,70 мс | 6,33 мс |
+| `postprocess` | 0,051 мс | 0,855 мс |
+
+- `tests/gen_cases.py` генерує випадкові схеми й записує вхід і вихід `original.py` у `tests/cases.json`; `tests/check_codon.py` проганяє ті самі входи через `libtwirl.dylib` і порівнює кожну інструкцію, фліпи й ймовірності.
+
 ## Про що проєкт
 
 `original.py` реалізує **measurement twirling** — прийом зменшення помилок вимірювання на квантовому процесорі:
@@ -94,25 +114,6 @@ flowchart LR
 | `np.random.default_rng` | NumPy, вбудований у Codon (ті самі фліпи) |
 
 Усередині функцій `list` і `dict` лишились — у Codon вони нативні; змінено лише те, що перетинає межу бібліотеки.
-
-## Перевірка і швидкість
-
-- `tests/gen_cases.py` генерує випадкові схеми й записує вхід і вихід `original.py` у `tests/cases.json`; `tests/check_codon.py` проганяє ті самі входи через `libtwirl.dylib` і порівнює кожну інструкцію, фліпи й ймовірності.
-- Час (медіана 50 запусків, 10 задач × 4 копії × 20 кубітів, M1 Pro під навантаженням; `probe/bench_rfm.c`, `probe/bench_rfm.py`):
-
-| | Codon | Python |
-|---|---|---|
-| `preprocess` | 0,70 мс | 6,33 мс |
-| `postprocess` | 0,051 мс | 0,855 мс |
-
-## Збірка і запуск
-
-```bash
-./build.sh                                   # libqiskit + libtwirl.dylib (Codon у ~/.codon)
-python3 -m venv .venv && .venv/bin/pip install qiskit numpy
-.venv/bin/python -I tests/gen_cases.py      # еталон з original.py
-python3 -I tests/check_codon.py             # порівняння з libtwirl.dylib
-```
 
 ## Обмеження
 
