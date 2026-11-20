@@ -15,7 +15,22 @@ enum {
     TWIRL_ERR_UNSUPPORTED_OP = 4,  // non-final measure, or an op other than gate/barrier/reset
     TWIRL_ERR_TOO_MANY_QUBITS = 5,
     TWIRL_ERR_EMPTY_RESULT = 6,
+    TWIRL_ERR_SYMBOLIC_PARAM = 7,  // a gate parameter is not a bound real number
+    TWIRL_ERR_QISKIT_VERSION = 8,  // loaded libqiskit differs from the qiskit.h libtwirl was built with
 };
+
+// Fast path of remove_final_measurements (no DAG) for circuits that are gates/resets followed by a
+// tail of measures/barriers; any other circuit takes the DAG port. Not thread-safe to switch.
+enum {
+    TWIRL_FAST_PATH_OFF = 0,     // always the DAG port
+    TWIRL_FAST_PATH_ON = 1,      // default
+    TWIRL_FAST_PATH_VERIFY = 2,  // run both, use the DAG result on a mismatch and count it
+};
+// Returns the previous mode, or -1 for an invalid one.
+int64_t twirl_set_fast_path(int64_t mode);
+// Counters since the library was loaded.
+int64_t twirl_fast_path_hits(void);
+int64_t twirl_fast_path_mismatches(void);
 
 typedef struct {
     QkCircuit *circuit;

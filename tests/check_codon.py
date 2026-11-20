@@ -2,6 +2,7 @@
 
 Needs no qiskit: circuits are built with the Qiskit C API (libqiskit) through ctypes.
 Run: python3 -I tests/check_codon.py   (exit code 0 iff every case matches)
+TWIRL_FAST_PATH=0|1|2 selects twirl_set_fast_path's mode (off / on, the default / verify).
 """
 import ctypes as C
 import json
@@ -14,19 +15,26 @@ ROOT = Path(__file__).resolve().parent.parent
 QISKIT_C = ROOT / "qiskit" / "dist" / "c"
 TOL = 1e-12
 
-# Python gate name -> QkGate enumerator; values are read from qiskit.h below.
-QK_NAMES = {
-    "h": "H", "x": "X", "y": "Y", "z": "Z", "s": "S", "sdg": "Sdg", "t": "T", "tdg": "Tdg",
-    "sx": "SX", "p": "Phase", "rx": "RX", "ry": "RY", "rz": "RZ", "u": "U", "cx": "CX",
-    "cz": "CZ", "swap": "Swap", "cp": "CPhase", "crx": "CRX", "rzz": "RZZ", "ccx": "CCX",
-}
-ERRORS = {"args": 1, "shots": 2, "qubits_mismatch": 3, "unsupported_op": 4, "too_many_qubits": 5, "empty_result": 6}
+ERRORS = {"args": 1, "shots": 2, "qubits_mismatch": 3, "unsupported_op": 4, "too_many_qubits": 5,
+          "empty_result": 6, "symbolic_param": 7, "qiskit_version": 8}
 
 
-def gate_values():
+def gate_values(qk):
+    """Gate name -> QkGate, read back from libqiskit (independently of libtwirl's own table)."""
     text = (QISKIT_C / "include" / "qiskit" / "types.h").read_text()
-    enum = dict(re.findall(r"QkGate_(\w+) = (\d+)", text))
-    return {py: int(enum[qk]) for py, qk in QK_NAMES.items()}
+    num_gates = max(int(v) for v in re.findall(r"QkGate_\w+ = (\d+)", text)) + 1
+    names = {}
+    for g in range(num_gates):
+        nq, npar = qk.qk_gate_num_qubits(g), qk.qk_gate_num_params(g)
+        c = qk.qk_circuit_new(nq, 0)
+        qk.qk_circuit_gate(c, g, u32s(range(nq)), (C.c_double * max(1, npar))())
+        if qk.qk_circuit_num_instructions(c) == 1:
+            inst = Instruction()
+            qk.qk_circuit_get_instruction(c, 0, C.byref(inst))
+            names[inst.name.decode()] = g
+            qk.qk_circuit_instruction_clear(C.byref(inst))
+        qk.qk_circuit_free(c)
+    return names
 
 
 class Instruction(C.Structure):  # QkCircuitInstruction
@@ -58,6 +66,11 @@ def load():
         "qk_circuit_num_instructions": ([C.c_void_p], C.c_size_t),
         "qk_circuit_get_instruction": ([C.c_void_p, C.c_size_t, C.POINTER(Instruction)], None),
         "qk_circuit_instruction_clear": ([C.POINTER(Instruction)], None),
+        "qk_gate_num_qubits": ([C.c_uint8], C.c_uint32),
+        "qk_gate_num_params": ([C.c_uint8], C.c_uint32),
+        "qk_param_new_symbol": ([C.c_char_p], C.c_void_p),
+        "qk_circuit_parameterized_gate": ([C.c_void_p, C.c_uint8, C.POINTER(C.c_uint32), C.POINTER(C.c_void_p)],
+                                          C.c_uint32),
     }
     for name, (args, ret) in sig.items():
         f = getattr(qk, name)
@@ -68,6 +81,9 @@ def load():
     tw.twirl_postprocess.argtypes = [p64, p64, p64, i64, C.POINTER(C.c_uint8), i64, i64, p64,
                                      C.POINTER(C.c_double), p64]
     tw.twirl_postprocess.restype = i64
+    tw.twirl_set_fast_path.argtypes = [i64]
+    for name in ("twirl_set_fast_path", "twirl_fast_path_hits", "twirl_fast_path_mismatches"):
+        getattr(tw, name).restype = i64
     return qk, tw
 
 
@@ -87,6 +103,13 @@ def build(qk, gates, spec):
             qk.qk_circuit_barrier(c, u32s(o["q"]), len(o["q"]))
         elif o["op"] == "reset":
             qk.qk_circuit_reset(c, o["q"][0])
+        elif any(isinstance(x, str) for x in o["p"]):
+            # A string param is an unbound symbol of that name.
+            params = [qk.qk_param_new_symbol(x.encode()) if isinstance(x, str) else qk.qk_param_from_double(x)
+                      for x in o["p"]]
+            qk.qk_circuit_parameterized_gate(c, gates[o["op"]], u32s(o["q"]), (C.c_void_p * len(params))(*params))
+            for x in params:
+                qk.qk_param_free(x)
         else:
             params = (C.c_double * max(1, len(o["p"])))(*o["p"])
             qk.qk_circuit_gate(c, gates[o["op"]], u32s(o["q"]), params)
@@ -198,7 +221,10 @@ def run_case(qk, tw, gates, case):
 
 def main():
     qk, tw = load()
-    gates = gate_values()
+    gates = gate_values(qk)
+    mode = int(os.environ.get("TWIRL_FAST_PATH", "1"))
+    if tw.twirl_set_fast_path(mode) < 0:
+        sys.exit(f"bad TWIRL_FAST_PATH {mode}")
     cases = json.loads(Path(__file__).with_name("cases.json").read_text())
     only = set(int(x) for x in sys.argv[1:])  # optional case ids to run
     failures = 0
@@ -212,8 +238,10 @@ def main():
             n = case["tasks"][0]["circuit"]["n"] if case["tasks"] else 0
             print(f"FAIL case {case['id']} (n={n}, k={case['num_instances']}, {endings}): {problem}")
     total = len(only) if only else len(cases)
-    print(f"{total - failures}/{total} cases match original.py ({os.environ.get('TWIRL_LIB', 'libtwirl.dylib')})")
-    sys.exit(1 if failures else 0)
+    mismatches = tw.twirl_fast_path_mismatches()
+    print(f"{total - failures}/{total} cases match original.py ({os.environ.get('TWIRL_LIB', 'libtwirl.dylib')}, "
+          f"fast path mode {mode}: {tw.twirl_fast_path_hits()} circuits via fast path, {mismatches} mismatches)")
+    sys.exit(1 if failures or mismatches else 0)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,8 @@ from pathlib import Path
 
 import numpy as np
 from qiskit import QuantumCircuit
+from qiskit.circuit import Parameter
+from qiskit.circuit.library import get_standard_gate_name_mapping
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -25,6 +27,9 @@ GATES = {
     "rz": (1, 1), "u": (1, 3), "cx": (2, 0), "cz": (2, 0), "swap": (2, 0), "cp": (2, 1),
     "crx": (2, 1), "rzz": (2, 1), "ccx": (3, 0),
 }
+# Every Rust-native standard gate, by name: these are the gates libqiskit's QkGate covers.
+STANDARD_GATES = {name: gate for name, gate in get_standard_gate_name_mapping().items()
+                  if getattr(gate, "_standard_gate", None) is not None}
 # How each case's circuit ends. All of them leave every clbit idle after
 # remove_final_measurements, the only shape twirl.codon accepts.
 ENDINGS = ["measure_all", "permuted", "subset", "none", "barrier_only", "interleaved", "trailing_barrier"]
@@ -98,7 +103,9 @@ def build(spec):
         elif o["op"] == "reset":
             qc.reset(o["q"][0])
         else:
-            getattr(qc, o["op"])(*o["p"], *o["q"])
+            # A string param is an unbound Parameter of that name.
+            params = [Parameter(x) if isinstance(x, str) else x for x in o["p"]]
+            qc.append(type(STANDARD_GATES[o["op"]])(*params), o["q"])
     return qc
 
 
@@ -110,7 +117,7 @@ def dump(qc):
             "op": inst.operation.name,
             "q": [qc.find_bit(b).index for b in inst.qubits],
             "c": [qc.find_bit(b).index for b in inst.clbits],
-            "p": [float(x) for x in inst.operation.params],
+            "p": [str(x) if getattr(x, "parameters", None) else float(x) for x in inst.operation.params],
         } for inst in qc.data],
     }
 
@@ -292,6 +299,45 @@ def extra_cases(first_id):
     add([task(circuit(2, 0, [op("rx", 0, p=[1e300]), op("p", 1, p=[-0.0]), op("u", 0, p=[1e-300, -1e300, 5e-324]),
                              op("rzz", 0, 1, p=[-1e-310]), op("cp", 1, 0, p=[6.283185307179586 * 1e15]),
                              op("ry", 1, p=[0.0])]), "none")], k=2)
+    # --- fast path coverage (twirl.codon's _remove_final_fast) ---
+    # Every standard gate, random qubits and params: with only a measure tail (fast path) and with
+    # an early final measure, which forces the DAG path. Exercises the runtime gate-name table.
+    names = sorted(STANDARD_GATES)
+    for force_dag in (False, True):
+        n = 5
+        # DAG variant: qubit 4 is measured first and never touched again, so that measure is final
+        # but sits before the gates, which sends the circuit to the DAG path.
+        width = 4 if force_dag else n
+        ops = [measure(4, 4)] if force_dag else []
+        for name in names:
+            gate = STANDARD_GATES[name]
+            ops.append(op(name, *rng.permutation(width)[:gate.num_qubits].tolist(),
+                          p=rng.uniform(-math.pi, math.pi, len(gate.params)).tolist()))
+        ops += [barrier(range(width))] + [measure(q, q) for q in range(width)]
+        add([task(circuit(n, n, ops, phase=0.25), "all_gates_dag" if force_dag else "all_gates_fast")], k=3)
+    # Order stress: wide, deep circuits on scattered qubits ending in a measure tail, so the fast
+    # path's lexicographic topological order must reproduce dag_to_circuit's exactly.
+    for _ in range(10):
+        n = int(rng.choice([7, 20, 40, 63]))
+        ops = []
+        for _ in range(int(rng.integers(50, 300))):
+            name = ["h", "x", "rz", "cx", "cz", "swap", "ccx", "reset"][int(rng.integers(8))]
+            if name == "reset":
+                ops.append(op("reset", int(rng.integers(n))))
+                continue
+            gate = STANDARD_GATES[name]
+            ops.append(op(name, *rng.choice(n, gate.num_qubits, replace=False).tolist(),
+                          p=rng.uniform(-math.pi, math.pi, len(gate.params)).tolist()))
+        ops += [barrier(range(n))] + [measure(q, q) for q in rng.permutation(n).tolist()]
+        k = int(rng.choice([1, 2, 4]))
+        add([task(circuit(n, n, ops), "order_stress", shots=5000)], k=k,
+            seed=int(rng.integers(0, 2**31)), results=[wide_counts(rng, n, 5) for _ in range(k)])
+    # Symbolic parameters: twirl.codon returns symbolic_param (the DAG port would otherwise abort
+    # inside libqiskit); original.py accepts them.
+    add([task(circuit(2, 2, [op("h", 0), op("rz", 1, p=["theta"]), measure(0, 0), measure(1, 1)]), "symbolic_fast")],
+        results=[], error="symbolic_param")
+    add([task(circuit(2, 2, [measure(0, 0), op("rz", 1, p=["theta"]), measure(1, 1)]), "symbolic_dag")],
+        results=[], error="symbolic_param")
     return cases
 
 
