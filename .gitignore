@@ -15,3 +15,8 @@ probe/rfm
 
 # Mutation-test scratch
 tests/mutants/
+
+# Compiled perf drivers
+perf/bench
+perf/floor
+perf/tail

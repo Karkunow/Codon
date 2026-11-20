@@ -1,0 +1,256 @@
+# Measurement twirling: preprocess/postprocess built as a C shared library.
+# Circuits go through the Qiskit C API (libqiskit, built with `make c`).
+import numpy as np
+
+
+@tuple
+class Neighbors:  # QkDagNeighbors
+    neighbors: Ptr[u32]
+    num_neighbors: int
+
+
+from C import qk_circuit_new(u32, u32) -> cobj
+from C import qk_circuit_free(cobj) -> None
+from C import qk_circuit_copy(cobj) -> cobj
+from C import qk_circuit_num_qubits(cobj) -> u32
+from C import qk_circuit_gate(cobj, u8, Ptr[u32], Ptr[float]) -> u32
+from C import qk_circuit_barrier(cobj, Ptr[u32], u32) -> u32
+from C import qk_circuit_measure(cobj, u32, u32) -> u32
+from C import qk_circuit_reset(cobj, u32) -> u32
+from C import qk_circuit_global_phase(cobj) -> cobj
+from C import qk_circuit_set_global_phase(cobj, cobj) -> u32
+from C import qk_param_free(cobj) -> None
+from C import qk_classical_register_new(u32, cobj) -> cobj
+from C import qk_classical_register_free(cobj) -> None
+from C import qk_circuit_add_classical_register(cobj, cobj) -> None
+from C import qk_circuit_to_dag(cobj) -> cobj
+from C import qk_dag_free(cobj) -> None
+from C import qk_dag_num_op_nodes(cobj) -> int
+from C import qk_dag_topological_op_nodes(cobj, Ptr[u32]) -> None
+from C import qk_dag_qubit_out_node(cobj, u32) -> u32
+from C import qk_dag_node_type(cobj, u32) -> u8
+from C import qk_dag_op_node_kind(cobj, u32) -> u8
+from C import qk_dag_op_node_num_qubits(cobj, u32) -> u32
+from C import qk_dag_op_node_qubits(cobj, u32) -> Ptr[u32]
+from C import qk_dag_op_node_num_params(cobj, u32) -> u32
+from C import qk_dag_op_node_gate_op(cobj, u32, Ptr[float]) -> u8
+from C import qk_dag_successors(cobj, u32) -> Neighbors
+from C import qk_dag_predecessors(cobj, u32) -> Neighbors
+from C import qk_dag_neighbors_clear(Ptr[Neighbors]) -> None
+
+# StandardGate::X in crates/circuit/src/standard_gate/mod.rs (#[repr(u8)]).
+QK_GATE_X = u8(3)
+# QkDagNodeType_Operation and QkOperationKind_* in dist/c/include/qiskit/types.h.
+QK_NODE_OPERATION = u8(0)
+QK_OP_GATE = u8(0)
+QK_OP_BARRIER = u8(1)
+QK_OP_MEASURE = u8(3)
+QK_OP_RESET = u8(4)
+
+TWIRL_OK = 0
+TWIRL_ERR_ARGS = 1             # no tasks, or num_instances < 1
+TWIRL_ERR_SHOTS = 2            # shots cannot be split over num_instances
+TWIRL_ERR_QUBITS_MISMATCH = 3  # tasks differ in num_qubits
+TWIRL_ERR_UNSUPPORTED_OP = 4   # a non-final measure, or an op other than gate/barrier/reset
+TWIRL_ERR_TOO_MANY_QUBITS = 5  # bitstrings are packed into int64
+TWIRL_ERR_EMPTY_RESULT = 6     # a result has zero shots
+
+
+@tuple
+class Task:
+    circuit: cobj  # QkCircuit*
+    shots: int
+
+
+def _neighbors(dag: cobj, node: int, successors: bool) -> list[int]:
+    nb = qk_dag_successors(dag, u32(node)) if successors else qk_dag_predecessors(dag, u32(node))
+    out = [int(nb.neighbors[i]) for i in range(nb.num_neighbors)]
+    qk_dag_neighbors_clear(__ptr__(nb))
+    return out
+
+
+def _shares_qubit(dag: cobj, a: int, b: int) -> bool:
+    qa = qk_dag_op_node_qubits(dag, u32(a))
+    qb = qk_dag_op_node_qubits(dag, u32(b))
+    for i in range(int(qk_dag_op_node_num_qubits(dag, u32(a)))):
+        for j in range(int(qk_dag_op_node_num_qubits(dag, u32(b)))):
+            if qa[i] == qb[j]:
+                return True
+    return False
+
+
+def _final_ops(dag: cobj, n: int) -> set[int]:
+    # Port of calc_final_ops in qiskit/transpiler/passes/utils/remove_final_measurements.py.
+    final: set[int] = set()
+    barrier_encounters_remaining: dict[int, int] = {}
+    to_visit = [_neighbors(dag, int(qk_dag_qubit_out_node(dag, u32(q))), False)[0] for q in range(n)]
+    while to_visit:
+        node = to_visit.pop()
+        if qk_dag_node_type(dag, u32(node)) != QK_NODE_OPERATION:
+            continue
+        kind = qk_dag_op_node_kind(dag, u32(node))
+        if kind == QK_OP_BARRIER:
+            # A barrier is final once it has been reached from every one of its successors.
+            if node not in barrier_encounters_remaining:
+                barrier_encounters_remaining[node] = len(_neighbors(dag, node, True))
+            if barrier_encounters_remaining[node] - 1 > 0:
+                barrier_encounters_remaining[node] -= 1
+                continue
+        if kind == QK_OP_MEASURE or kind == QK_OP_BARRIER:
+            final.add(node)
+            # Quantum predecessors only: a predecessor reached over a clbit wire does not count.
+            for p in _neighbors(dag, node, False):
+                if qk_dag_node_type(dag, u32(p)) == QK_NODE_OPERATION and _shares_qubit(dag, node, p):
+                    to_visit.append(p)
+    return final
+
+
+def _remove_final_measurements(circuit: cobj) -> cobj:
+    """remove_final_measurements(inplace=False) for circuits whose clbits all become idle.
+
+    Rebuilds the circuit without clbits. Returns a null cobj if the circuit has a non-final
+    measure or an op other than gate/barrier/reset. Gates must have numeric params: libqiskit
+    panics on a symbolic one.
+    """
+    dag = qk_circuit_to_dag(circuit)
+    n = int(qk_circuit_num_qubits(circuit))
+    final = _final_ops(dag, n)
+    bare = qk_circuit_new(u32(n), u32(0))
+    phase = qk_circuit_global_phase(circuit)
+    qk_circuit_set_global_phase(bare, phase)
+    qk_param_free(phase)
+
+    num_ops = qk_dag_num_op_nodes(dag)
+    order = Ptr[u32](num_ops)
+    qk_dag_topological_op_nodes(dag, order)
+    supported = True
+    for i in range(num_ops):
+        node = order[i]
+        if int(node) in final:
+            continue
+        kind = qk_dag_op_node_kind(dag, node)
+        qubits = qk_dag_op_node_qubits(dag, node)
+        if kind == QK_OP_GATE:
+            params = Ptr[float](max(1, int(qk_dag_op_node_num_params(dag, node))))
+            gate = qk_dag_op_node_gate_op(dag, node, params)
+            qk_circuit_gate(bare, gate, qubits, params)
+        elif kind == QK_OP_BARRIER:
+            qk_circuit_barrier(bare, qubits, qk_dag_op_node_num_qubits(dag, node))
+        elif kind == QK_OP_RESET:
+            qk_circuit_reset(bare, qubits[0])
+        else:
+            supported = False
+            break
+    qk_dag_free(dag)
+    if not supported:
+        qk_circuit_free(bare)
+        return cobj()
+    return bare
+
+
+def _add_meas_register(circuit: cobj, n: int):
+    # The "meas" register of QuantumCircuit.measure_all(), added to the bare circuit once per task:
+    # every copy inherits it, so the per-copy tail is only the barrier and the measures.
+    reg = qk_classical_register_new(u32(n), "meas".c_str())
+    qk_circuit_add_classical_register(circuit, reg)
+    qk_classical_register_free(reg)
+
+
+def _measure_tail(circuit: cobj, n: int):
+    # The rest of measure_all(): barrier, qubit q -> clbit q.
+    qk_circuit_barrier(circuit, Ptr[u32](), u32(0))
+    for q in range(n):
+        qk_circuit_measure(circuit, u32(q), u32(q))
+
+
+def _free_all(circuits: list[cobj]):
+    for c in circuits:
+        qk_circuit_free(c)
+
+
+@export
+def twirl_preprocess(tasks: Ptr[Task], num_tasks: int, num_instances: int, seed: int,
+                     out_tasks: Ptr[Task], out_flips: Ptr[u8]) -> int:
+    """out_tasks: num_tasks * num_instances; out_flips: num_instances * num_qubits.
+
+    Final measurements and barriers are removed as remove_final_measurements does.
+    The caller frees every out_tasks[i].circuit with qk_circuit_free.
+    """
+    if num_tasks < 1 or num_instances < 1:
+        return TWIRL_ERR_ARGS
+    n = int(qk_circuit_num_qubits(tasks[0].circuit))
+    if n > 63:
+        return TWIRL_ERR_TOO_MANY_QUBITS
+    bares: list[cobj] = []
+    for t in range(num_tasks):
+        if tasks[t].shots < num_instances:
+            _free_all(bares)
+            return TWIRL_ERR_SHOTS
+        if int(qk_circuit_num_qubits(tasks[t].circuit)) != n:
+            _free_all(bares)
+            return TWIRL_ERR_QUBITS_MISMATCH
+        bare = _remove_final_measurements(tasks[t].circuit)
+        if bare == cobj():
+            _free_all(bares)
+            return TWIRL_ERR_UNSUPPORTED_OP
+        _add_meas_register(bare, n)
+        bares.append(bare)
+
+    # flips[j, q] == 1 puts an X on qubit q right before measurement in copy j.
+    flips = np.random.default_rng(seed).integers(0, 2, size=(num_instances, n))
+    for j in range(num_instances):
+        for q in range(n):
+            out_flips[j * n + q] = u8(int(flips[j, q]))
+
+    qubit = Ptr[u32](1)
+    for t in range(num_tasks):
+        for j in range(num_instances):
+            circuit = qk_circuit_copy(bares[t])
+            for q in range(n):
+                if out_flips[j * n + q]:
+                    qubit[0] = u32(q)
+                    qk_circuit_gate(circuit, QK_GATE_X, qubit, Ptr[float]())
+            _measure_tail(circuit, n)
+            out_tasks[t * num_instances + j] = Task(circuit, tasks[t].shots // num_instances)
+    _free_all(bares)
+    return TWIRL_OK
+
+
+@export
+def twirl_postprocess(bits: Ptr[int], counts: Ptr[int], offsets: Ptr[int], num_tasks: int,
+                      flips: Ptr[u8], num_instances: int, num_qubits: int,
+                      out_bits: Ptr[int], out_probs: Ptr[float], out_offsets: Ptr[int]) -> int:
+    """Result r = t * num_instances + j holds entries [offsets[r], offsets[r + 1]).
+
+    out_bits/out_probs need offsets[num_tasks * num_instances] slots; out_offsets num_tasks + 1.
+    Task t's merged distribution is written to [out_offsets[t], out_offsets[t + 1]).
+    """
+    k = num_instances
+    n = num_qubits
+    # Qiskit bitstrings are little-endian: qubit q is bit q of int(bits, 2).
+    masks = [0] * k
+    for j in range(k):
+        for q in range(n):
+            if int(flips[j * n + q]):
+                masks[j] |= 1 << q
+
+    w = 0
+    out_offsets[0] = 0
+    for t in range(num_tasks):
+        probs: dict[int, float] = {}
+        for j in range(k):
+            r = t * k + j
+            shots = 0
+            for e in range(offsets[r], offsets[r + 1]):
+                shots += counts[e]
+            if shots == 0:
+                return TWIRL_ERR_EMPTY_RESULT
+            for e in range(offsets[r], offsets[r + 1]):
+                unflipped = bits[e] ^ masks[j]
+                probs[unflipped] = probs.get(unflipped, 0.0) + counts[e] / shots / k
+        for unflipped, p in probs.items():
+            out_bits[w] = unflipped
+            out_probs[w] = p
+            w += 1
+        out_offsets[t + 1] = w
+    return TWIRL_OK
