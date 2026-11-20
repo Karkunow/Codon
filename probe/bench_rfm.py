@@ -5,7 +5,10 @@ import numpy as np
 from qiskit import QuantumCircuit
 from original import preprocess, postprocess, State, Task
 
-n, T, RUNS = 20, 10, 50
+# Usage: bench_rfm.py [n T]   (defaults 20 10, the sizes of probe/bench_rfm.c)
+n = int(sys.argv[1]) if len(sys.argv) > 1 else 20
+T = int(sys.argv[2]) if len(sys.argv) > 2 else 10
+RUNS = 50
 
 
 def build():
@@ -27,5 +30,5 @@ for _ in range(RUNS):
     t0 = time.perf_counter()
     postprocess(results, st, ctx)
     post.append((time.perf_counter() - t0) * 1000)
-print(f"python: preprocess median {statistics.median(pre):.3f} ms (min {min(pre):.3f}); "
+print(f"python n={n} T={T}: preprocess median {statistics.median(pre):.3f} ms (min {min(pre):.3f}); "
       f"postprocess median {statistics.median(post):.3f} ms (min {min(post):.3f})")
